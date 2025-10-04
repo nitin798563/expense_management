@@ -2,10 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from database import get_db
 from api.auth import get_current_user
 from models import ExpenseCreate
-import json
+import json, datetime
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
+# ---------------------------------
+# Helper: Load rule
+# ---------------------------------
 def load_rule(rule_id):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
@@ -16,18 +19,20 @@ def load_rule(rule_id):
     if not r:
         return None
     try:
-        r["approvers"] = json.loads(r["approvers"]) if r.get("approvers") else []
+        r["approvers"] = json.loads(r.get("approvers") or "[]")
     except:
         r["approvers"] = []
     return r
 
+# ---------------------------------
+# Helper: Manager chain (up to 10 levels)
+# ---------------------------------
 def get_manager_chain(username):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
     chain = []
     current = username
-    depth = 0
-    while depth < 10:
+    for _ in range(10):
         cur.execute("SELECT manager FROM users WHERE username = %s", (current,))
         row = cur.fetchone()
         if not row or not row.get("manager"):
@@ -37,54 +42,105 @@ def get_manager_chain(username):
             break
         chain.append(manager)
         current = manager
-        depth += 1
     cur.close()
     conn.close()
     return chain
 
+# ---------------------------------
+# Helper: Conditional Approvers
+# ---------------------------------
+def get_conditional_approvers(amount, category):
+    """Auto-select approvers based on 'conditional_rules' table"""
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM conditional_rules")
+    rules = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    result = []
+    for r in rules:
+        field = r.get("condition_field")
+        op = r.get("operator")
+        val = r.get("value")
+        approver = r.get("approver")
+
+        # Compare numeric (amount)
+        if field == "amount":
+            try:
+                amt = float(amount)
+                val_f = float(val)
+                if op == ">" and amt > val_f: result.append(approver)
+                elif op == "<" and amt < val_f: result.append(approver)
+                elif op in ("=", "==") and amt == val_f: result.append(approver)
+            except:
+                continue
+
+        # Compare text (category)
+        if field == "category":
+            if op in ("=", "==") and category.lower() == val.lower():
+                result.append(approver)
+
+    return list(set(result))
+
+# ---------------------------------
+# POST /expenses — Employee submits
+# ---------------------------------
 @router.post("/", summary="Submit expense (employee)")
 def create_expense(exp: ExpenseCreate, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "employee":
         raise HTTPException(status_code=403, detail="Only employees can submit expenses")
 
     approvers = []
-    manager_chain = get_manager_chain(current_user["username"])
-    if manager_chain:
-        approvers.extend(manager_chain)
 
+    # Step 1️⃣ Manager chain
+    approvers.extend(get_manager_chain(current_user["username"]))
+
+    # Step 2️⃣ Rule-based approvers
     if exp.rule_id:
         rule = load_rule(exp.rule_id)
         if rule:
-            if rule["type"] in ("specific", "hybrid") and rule.get("specific_approver"):
-                if rule["specific_approver"] not in approvers:
-                    approvers.append(rule["specific_approver"])
-            if rule.get("approvers"):
-                for a in rule["approvers"]:
-                    if a not in approvers:
-                        approvers.append(a)
+            for a in rule.get("approvers", []):
+                if a not in approvers:
+                    approvers.append(a)
+            if rule.get("specific_approver") and rule["specific_approver"] not in approvers:
+                approvers.append(rule["specific_approver"])
 
-    comments = []
-    votes = []
+    # Step 3️⃣ Conditional approvers (auto rules)
+    for a in get_conditional_approvers(exp.amount, exp.category):
+        if a not in approvers:
+            approvers.append(a)
+
+    comments, votes = [], []
 
     conn = get_db()
     cur = conn.cursor()
     try:
         cur.execute("""
             INSERT INTO expenses (employee, amount, currency, category, description, status, approvers, comments, votes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (current_user["username"], exp.amount, exp.currency, exp.category, exp.description,
-              "pending", json.dumps(approvers), json.dumps(comments), json.dumps(votes)))
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            current_user["username"], exp.amount, exp.currency, exp.category, exp.description,
+            "pending", json.dumps(approvers), json.dumps(comments), json.dumps(votes)
+        ))
         conn.commit()
-        inserted_id = cur.lastrowid
+        expense_id = cur.lastrowid
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         cur.close()
         conn.close()
-    return {"msg": "Expense submitted", "expense_id": inserted_id}
 
+    return {
+        "msg": "Expense submitted successfully",
+        "expense_id": expense_id,
+        "approvers": approvers
+    }
 
+# ---------------------------------
+# GET /expenses — role filtered
+# ---------------------------------
 @router.get("/", summary="Get expenses (role filtered)")
 def get_expenses(current_user: dict = Depends(get_current_user)):
     conn = get_db()
@@ -93,8 +149,13 @@ def get_expenses(current_user: dict = Depends(get_current_user)):
     if current_user["role"] == "admin":
         cur.execute("SELECT * FROM expenses ORDER BY created_at DESC")
     elif current_user["role"] == "manager":
-        # Manager sees all pending expenses
-        cur.execute("SELECT * FROM expenses ORDER BY created_at DESC")
+        # Managers see all expenses from their team
+        cur.execute("""
+            SELECT * FROM expenses 
+            WHERE employee IN (SELECT username FROM users WHERE manager = %s)
+            OR status IN ('pending','approved','rejected')
+            ORDER BY created_at DESC
+        """, (current_user["username"],))
     else:
         cur.execute("SELECT * FROM expenses WHERE employee = %s ORDER BY created_at DESC", (current_user["username"],))
 
@@ -103,25 +164,24 @@ def get_expenses(current_user: dict = Depends(get_current_user)):
     conn.close()
 
     for r in rows:
-        try:
-            r["approvers"] = json.loads(r["approvers"]) if r.get("approvers") else []
-            r["comments"] = json.loads(r["comments"]) if r.get("comments") else []
-            r["votes"] = json.loads(r["votes"]) if r.get("votes") else []
-        except:
-            pass
+        for key in ["approvers", "comments", "votes"]:
+            try:
+                r[key] = json.loads(r.get(key) or "[]")
+            except:
+                r[key] = []
     return rows
 
-
+# ---------------------------------
+# POST /approve
+# ---------------------------------
 @router.post("/{expense_id}/approve", summary="Approve an expense")
 def approve_expense(expense_id: int, comment: str = Body(None), current_user: dict = Depends(get_current_user)):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT * FROM expenses WHERE id = %s", (expense_id,))
-    exp = cur.fetchone()
 
+    cur.execute("SELECT * FROM expenses WHERE id=%s", (expense_id,))
+    exp = cur.fetchone()
     if not exp:
-        cur.close()
-        conn.close()
         raise HTTPException(status_code=404, detail="Expense not found")
 
     approvers = json.loads(exp["approvers"]) if exp.get("approvers") else []
@@ -130,94 +190,37 @@ def approve_expense(expense_id: int, comment: str = Body(None), current_user: di
 
     username = current_user["username"]
 
-    # ✅ FIXED: Allow both admin and manager
     if username not in approvers and current_user["role"] not in ("admin", "manager"):
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=403, detail="Not authorized to approve this expense")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
-    if comment:
-        comments.append(f"{username}: {comment}")
-    else:
-        comments.append(f"{username}: Approved")
+    comments.append(f"{username}: {comment or 'Approved'}")
+    votes.append({"user": username, "decision": "approve", "at": datetime.datetime.utcnow().isoformat()})
 
-    votes.append({"user": username, "decision": "approve"})
-
-    cur.execute("SELECT * FROM rules WHERE is_active = 1")
-    rules = cur.fetchall()
-    active_rules = []
-    for r in rules:
-        try:
-            r["approvers"] = json.loads(r["approvers"]) if r.get("approvers") else []
-        except:
-            r["approvers"] = []
-        active_rules.append(r)
-
-    new_status = exp["status"]
     if username in approvers:
         approvers.remove(username)
 
-    percentage_rules = [r for r in active_rules if r["type"] == "percentage"]
-    specific_rules = [r for r in active_rules if r["type"] == "specific"]
-    hybrid_rules = [r for r in active_rules if r["type"] == "hybrid"]
-
-    def compute_percentage(rule):
-        pool = rule.get("approvers", [])
-        if not pool:
-            return 0
-        approved = sum(1 for v in votes if v["decision"] == "approve" and v["user"] in pool)
-        percent = int((approved / len(pool)) * 100)
-        return percent
-
-    auto_approved = False
-    for r in specific_rules:
-        sp = r.get("specific_approver")
-        if sp and (username == sp or current_user.get("role") == sp):
-            new_status = "approved"
-            auto_approved = True
-            break
-
-    if not auto_approved:
-        for r in percentage_rules:
-            percent = compute_percentage(r)
-            thr = r.get("threshold") or 0
-            if percent >= thr:
-                new_status = "approved"
-                break
-
-    if not auto_approved:
-        for r in hybrid_rules:
-            thr = r.get("threshold") or 0
-            percent = compute_percentage(r)
-            sp = r.get("specific_approver")
-            if percent >= thr:
-                new_status = "approved"
-                break
-            if any(v for v in votes if v["user"] == sp and v["decision"] == "approve"):
-                new_status = "approved"
-                break
-
-    if not approvers and new_status == "pending":
+    new_status = exp["status"]
+    if not approvers:
         new_status = "approved"
 
-    cur.execute("UPDATE expenses SET status = %s, approvers = %s, comments = %s, votes = %s WHERE id = %s",
+    cur.execute("UPDATE expenses SET status=%s, approvers=%s, comments=%s, votes=%s WHERE id=%s",
                 (new_status, json.dumps(approvers), json.dumps(comments), json.dumps(votes), expense_id))
     conn.commit()
     cur.close()
     conn.close()
-    return {"msg": "Approved", "status": new_status, "approvers_remaining": approvers}
+    return {"msg": "Expense approved", "status": new_status, "remaining": approvers}
 
-
+# ---------------------------------
+# POST /reject
+# ---------------------------------
 @router.post("/{expense_id}/reject", summary="Reject an expense")
 def reject_expense(expense_id: int, comment: str = Body(None), current_user: dict = Depends(get_current_user)):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT * FROM expenses WHERE id = %s", (expense_id,))
-    exp = cur.fetchone()
 
+    cur.execute("SELECT * FROM expenses WHERE id=%s", (expense_id,))
+    exp = cur.fetchone()
     if not exp:
-        cur.close()
-        conn.close()
         raise HTTPException(status_code=404, detail="Expense not found")
 
     approvers = json.loads(exp["approvers"]) if exp.get("approvers") else []
@@ -226,18 +229,11 @@ def reject_expense(expense_id: int, comment: str = Body(None), current_user: dic
 
     username = current_user["username"]
 
-    # ✅ FIXED: Allow both admin and manager
     if username not in approvers and current_user["role"] not in ("admin", "manager"):
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=403, detail="Not authorized to reject this expense")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
-    if comment:
-        comments.append(f"{username}: {comment}")
-    else:
-        comments.append(f"{username}: Rejected")
-
-    votes.append({"user": username, "decision": "reject"})
+    comments.append(f"{username}: {comment or 'Rejected'}")
+    votes.append({"user": username, "decision": "reject", "at": datetime.datetime.utcnow().isoformat()})
 
     cur.execute("UPDATE expenses SET status=%s, approvers=%s, comments=%s, votes=%s WHERE id=%s",
                 ("rejected", json.dumps([]), json.dumps(comments), json.dumps(votes), expense_id))

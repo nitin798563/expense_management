@@ -47,6 +47,19 @@ def setup_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+    
+    # conditional_rules - optional dynamic approval triggers
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS conditional_rules (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(200) NOT NULL,
+        condition_field VARCHAR(100),   -- e.g. 'amount' or 'category'
+        operator VARCHAR(10),            -- e.g. '>', '<', '=', '=='
+        value VARCHAR(100),
+        approver VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
 
     # expense_approvers - each approver's decision in sequence
     cur.execute("""
