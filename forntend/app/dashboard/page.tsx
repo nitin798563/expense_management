@@ -107,10 +107,12 @@ export default function DashboardHome() {
   });
 
   // ✅ Manager/Admin ke liye pending default view
-  const displayedExpenses =
-    user?.role === "manager" || user?.role === "admin"
-      ? searchedExpenses.filter((exp) => exp.status === filter)
-      : searchedExpenses;
+ const displayedExpenses =
+  user?.role === "manager" || user?.role === "admin"
+    ? filter === "all"
+      ? searchedExpenses
+      : searchedExpenses.filter((exp) => exp.status === filter)
+    : searchedExpenses;
 
   const paginatedExpenses = displayedExpenses.slice(
     (currentPage - 1) * itemsPerPage,
@@ -357,11 +359,11 @@ function ExpenseTable({
           {data.map((exp) => (
             <tr key={exp.id} className="border-t hover:bg-indigo-50/30">
               {role !== "employee" && (
-                <td className="p-3">{exp.employee || "N/A"}</td>
+                <td className="p-3 text-gray-600">{exp.employee || "N/A"}</td>
               )}
-              <td className="p-3">{exp.category}</td>
+              <td className="p-3 text-gray-600">{exp.category}</td>
               <td className="p-3 text-gray-600">{exp.description}</td>
-              <td className="p-3 font-medium">
+              <td className="p-3 text-gray-600">
                 {exp.currency} {exp.amount}
               </td>
               <td className="p-3">
