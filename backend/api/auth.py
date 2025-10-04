@@ -17,7 +17,10 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# Use Argon2 instead of bcrypt
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
@@ -61,6 +64,8 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 def signup(user: UserCreate):
     conn = get_db()
     cur = conn.cursor()
+    
+    
     hashed = get_password_hash(user.password)
     try:
         cur.execute("INSERT INTO users (username, password, role, manager) VALUES (%s, %s, %s, %s)",
@@ -74,7 +79,7 @@ def signup(user: UserCreate):
         conn.close()
     return {"msg": "User created"}
 
-@router.post("/token")
+@router.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
@@ -89,3 +94,13 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
     token = create_access_token({"sub": user["username"], "role": user["role"]})
     return {"access_token": token, "token_type": "bearer"}
+
+@router.get("/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    # return minimal safe user info
+    return {
+        "id": current_user.get("id"),
+        "username": current_user.get("username"),
+        "role": current_user.get("role"),
+        "manager": current_user.get("manager"),
+    }

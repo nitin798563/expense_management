@@ -1,9 +1,9 @@
-
 from database import get_db
 
 def setup_database():
     conn = get_db()
     cur = conn.cursor()
+
     # users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -15,6 +15,7 @@ def setup_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
     # expenses
     cur.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
@@ -31,19 +32,48 @@ def setup_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
     # rules - approval rules configured by admin
     cur.execute("""
     CREATE TABLE IF NOT EXISTS rules (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(200),
-        type VARCHAR(50), -- 'percentage' | 'specific' | 'hybrid' | 'sequential'
+        type VARCHAR(50), -- 'percentage' | 'specific' | 'hybrid' | 'sequence'
         threshold INT, -- used for percentage (0-100)
         approvers JSON, -- list of usernames who vote/are approvers
         specific_approver VARCHAR(100), -- username or role (string)
+        seq JSON, -- ordered approvers (for sequence flow)
         is_active TINYINT(1) DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # expense_approvers - each approver's decision in sequence
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS expense_approvers (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        expense_id INT NOT NULL,
+        approver VARCHAR(100) NOT NULL,
+        seq INT NOT NULL DEFAULT 0,
+        decision ENUM('pending','approved','rejected') DEFAULT 'pending',
+        decided_at DATETIME NULL,
+        comment TEXT NULL,
+        FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE
+    );
+    """)
+
+    # receipts - for uploaded expense receipts
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        expense_id INT NOT NULL,
+        filename VARCHAR(255),
+        url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE
+    );
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
