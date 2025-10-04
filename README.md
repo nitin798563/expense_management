@@ -9,9 +9,9 @@
 
 👩‍💻 Participant Details
 
-Name: Nitin Kushwaha
-Project Title: Expense Approval Management System
-Participation Type: Individual
+Name: Nitin Kushwaha<br>
+Project Title: Expense Approval Management System<br>
+Participation Type: Individual<br>
 Problem Statement: Automated Expense Tracking & Approval Flow
 
 
